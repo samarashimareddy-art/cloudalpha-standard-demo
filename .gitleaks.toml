@@ -1,0 +1,9 @@
+# Stage 2, source code analysis: GitLeaks with the default rules.
+title = "cloudalpha-standard-demo"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test data and build output"
+paths = ['''target/''', '''perf-report/''']

@@ -1,0 +1,9 @@
+target/
+perf-report/
+*.jtl
+*.log
+.idea/
+.vscode/
+*.iml
+.DS_Store
+.cloudalpha/

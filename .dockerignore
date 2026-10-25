@@ -1,0 +1,8 @@
+target/
+perf/
+perf-report/
+k8s/
+.zap/
+.git/
+.github/
+*.md

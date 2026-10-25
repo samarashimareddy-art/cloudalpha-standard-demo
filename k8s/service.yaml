@@ -1,0 +1,15 @@
+# The Dev URL the smoke, regression, acceptance, ZAP and JMeter stages use.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudalpha-standard-demo
+  labels:
+    app: cloudalpha-standard-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: cloudalpha-standard-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
