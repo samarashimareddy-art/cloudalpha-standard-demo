@@ -1,12 +1,12 @@
 # Stage 6, package: a small, non-root image with a pinned base.
-FROM maven:3.9.9-eclipse-temurin-17 AS build
+FROM maven:3.9.16-eclipse-temurin-17 AS build
 WORKDIR /src
 COPY pom.xml .
 RUN mvn -B -q dependency:go-offline
 COPY src ./src
 RUN mvn -B -q package -DskipTests
 
-FROM eclipse-temurin:17.0.12_7-jre
+FROM eclipse-temurin:17.0.20_8-jre
 WORKDIR /app
 COPY --from=build /src/target/app.jar app.jar
 ENV PORT=8080
