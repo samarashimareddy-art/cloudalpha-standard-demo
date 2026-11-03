@@ -20,6 +20,8 @@
   <properties>
     <java.version>17</java.version>
     <cucumber.version>7.34.9</cucumber.version>
+    <!-- Cucumber 7.34 is built for JUnit 5.14; Spring Boot 3.5 manages 5.12 -->
+    <junit-jupiter.version>5.14.2</junit-jupiter.version>
     <!-- Regression and acceptance tests run against a deployed URL (stages 10, 11). -->
     <base.url>http://localhost:8080</base.url>
     <!-- Unit-test line coverage the build must reach (company standard, unit test stage). -->
