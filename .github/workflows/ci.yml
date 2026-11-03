@@ -117,9 +117,10 @@ jobs:
       - name: Run Trivy container scan
         run: |
           # Findings as a table in the log; the gate blocks on every HIGH/CRITICAL
-          # vulnerability that has a fix (--ignore-unfixed: none can be fixed yet).
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --no-progress --format table ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --no-progress ${{ env.IMAGE_NAME }}:${{ env.VERSION }} --format json --output /out/trivy-image-report.json
+          # vulnerability that has a fix (--ignore-unfixed: none can be fixed yet),
+          # except the dated risk acceptances in .trivyignore.
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --ignorefile /out/.trivyignore --no-progress --format table ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --ignore-unfixed --ignorefile /out/.trivyignore --exit-code 1 --no-progress ${{ env.IMAGE_NAME }}:${{ env.VERSION }} --format json --output /out/trivy-image-report.json
       - name: Upload Docker image scan report
         uses: actions/upload-artifact@v4
         with:

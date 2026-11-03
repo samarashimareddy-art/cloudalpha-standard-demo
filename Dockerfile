@@ -13,7 +13,8 @@ WORKDIR /app
 COPY --from=build /src/target/app.jar app.jar
 ENV PORT=8080
 EXPOSE 8080
-RUN adduser -S -D -u 10001 appuser
+# Pick up Alpine security fixes released after the base image (brotli, expat).
+RUN apk upgrade --no-cache && adduser -S -D -u 10001 appuser
 USER 10001
 # Health is checked by Kubernetes (k8s/deployment.yaml probes) and the smoke test stage.
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]

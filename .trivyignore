@@ -1,0 +1,5 @@
+# Accepted risks for the image scan. Each entry needs a reason and an expiry date.
+# spring-webmvc 6.2.x: the only fix is Spring Framework 7.0.9 (Spring Boot 4).
+# The app uses neither XsltView nor Server-Sent Events. Revisit with the Boot 4 upgrade.
+CVE-2026-47884 exp:2026-12-31
+CVE-2026-47890 exp:2026-12-31
