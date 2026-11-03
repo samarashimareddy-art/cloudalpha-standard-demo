@@ -1,0 +1,390 @@
+name: CloudAlpha Standard Demo CI/CD
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ENVIRONMENT:
+        description: 'Target environment'
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+      VERSION:
+        description: 'Version tag (empty = commit short SHA)'
+        type: string
+        default: ''
+      RUN_REGRESSION:
+        description: 'Run regression and acceptance tests'
+        type: boolean
+        default: true
+      RUN_PERFORMANCE:
+        description: 'Run JMeter performance tests'
+        type: boolean
+        default: false
+      GATE_MODE:
+        description: 'Failure gates block or warn'
+        type: choice
+        options: [block, warn]
+        default: block
+jobs:
+  static-analysis:
+    name: Static Analysis & Security Scanning
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Failure gate 1 criteria
+        run: |
+          echo "Failure gate 1 criteria - SonarQube quality gate, no CRITICAL or HIGH secrets, no CRITICAL or HIGH vulnerable dependencies"
+      - name: Run SonarQube scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          args: >
+            -Dsonar.projectKey=samarashimareddy-art_cloudalpha-standard-demo -Dsonar.organization=samarashimareddy-art -Dsonar.host.url=https://sonarcloud.io -Dsonar.qualitygate.wait=true
+
+      - name: Install GitLeaks and run secret scan
+        run: |
+          curl -sSL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks detect --redact --exit-code 1 --report-path gitleaks-report.json
+      - name: Run Trivy filesystem scan
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src aquasec/trivy:0.50.1 fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --no-progress . --format json --output trivy-fs-report.json
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-reports
+          path: |
+            gitleaks-report.json
+            trivy-fs-report.json
+          retention-days: 14
+  build:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+    needs: static-analysis
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Build with Maven
+        run: mvn -B package --file pom.xml
+      - name: Run unit tests
+        run: mvn -B test --file pom.xml
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 14
+  package:
+    name: Package Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+      - name: Set IMAGE_NAME env
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Set VERSION env
+        run: echo "VERSION=${{ inputs.VERSION || github.sha }}" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          push: false
+          load: true
+      - name: Run Trivy container scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --exit-code 1 --no-progress ${{ env.IMAGE_NAME }}:${{ env.VERSION }} --format json --output trivy-image-report.json
+      - name: Upload Docker image scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-scan
+          path: trivy-image-report.json
+          retention-days: 14
+  publish:
+    name: Publish Docker Image
+    runs-on: ubuntu-latest
+    needs: package
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set IMAGE_NAME env
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Set VERSION env
+        run: echo "VERSION=${{ inputs.VERSION || github.sha }}" >> "$GITHUB_ENV"
+      - name: Check REGISTRY setting
+        run: |
+          if [ "${{ vars.REGISTRY }}" = "" ]; then
+            echo "REGISTRY not set - image built but not published"
+            exit 0
+          fi
+      - name: Configure AWS credentials
+        if: vars.REGISTRY != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Login to registry
+        if: vars.REGISTRY != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.REGISTRY }}
+      - name: Push Docker image
+        if: vars.REGISTRY != ''
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          tags: ${{ vars.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          push: true
+  deploy-dev:
+    name: Deploy to Dev Environment
+    runs-on: ubuntu-latest
+    needs: publish
+    environment: ${{ inputs.ENVIRONMENT || 'dev' }} # prod environment must have required reviewers
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Check Dev environment configuration
+        run: |
+          if [ "${{ vars.AWS_ROLE_ARN }}" = "" ] || [ "${{ vars.EKS_CLUSTER }}" = "" ] || [ "${{ vars.DEV_NAMESPACE }}" = "" ] || [ "${{ vars.DEV_URL }}" = "" ]; then
+            echo "Dev environment not configured - deploy skipped"
+            exit 0
+          fi
+      - name: Configure AWS credentials
+        if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Update kubeconfig
+        if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
+        run: |
+          aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER }} --region ${{ vars.AWS_REGION }}
+      - name: Create namespace if missing
+        if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
+        run: |
+          kubectl create namespace ${{ vars.DEV_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+      - name: Deploy manifests
+        if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
+        run: |
+          kubectl apply -f k8s/
+      - name: Wait for rollout
+        if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
+        run: |
+          kubectl rollout status deployment/cloudalpha-standard-demo --namespace=${{ vars.DEV_NAMESPACE }} --timeout=300s
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    env:
+      DEV_URL: ${{ vars.DEV_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Smoke test
+        if: vars.DEV_URL != ''
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do curl -fsS "$DEV_URL/actuator/health" && exit 0; sleep 10; done; exit 1
+      - name: DEV_URL not set - smoke test skipped
+        if: vars.DEV_URL == ''
+        run: echo "DEV_URL not set - smoke test skipped"
+  regression-test:
+    name: Regression Test
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    env:
+      DEV_URL: ${{ vars.DEV_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Regression test
+        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+        run: mvn -B verify -Dbase.url=$DEV_URL
+      - name: DEV_URL not set - regression test skipped
+        if: vars.DEV_URL == ''
+        run: echo "DEV_URL not set - regression test skipped"
+      - name: Upload regression test report
+        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-test-report
+          path: target/surefire-reports/*.xml
+          retention-days: 14
+  acceptance-test:
+    name: Acceptance Test
+    runs-on: ubuntu-latest
+    needs: regression-test
+    env:
+      DEV_URL: ${{ vars.DEV_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Acceptance test
+        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+        run: mvn -B verify -Dtest='*Cucumber*,*Acceptance*' -Dsurefire.failIfNoSpecifiedTests=false -Dbase.url=$DEV_URL
+      - name: DEV_URL not set - acceptance test skipped
+        if: vars.DEV_URL == ''
+        run: echo "DEV_URL not set - acceptance test skipped"
+      - name: Upload acceptance test report
+        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-test-report
+          path: target/surefire-reports/*.xml
+          retention-days: 14
+  dast:
+    name: DAST - OWASP ZAP
+    runs-on: ubuntu-latest
+    needs: acceptance-test
+    env:
+      DEV_URL: ${{ vars.DEV_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run OWASP ZAP baseline scan
+        if: vars.DEV_URL != ''
+        run: |
+          docker run --rm -v "$PWD:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "$DEV_URL" -r zap-report.html -J zap-report.json -I
+      - name: DEV_URL not set - DAST skipped
+        if: vars.DEV_URL == ''
+        run: echo "DEV_URL not set - DAST skipped"
+      - name: Upload ZAP report
+        if: vars.DEV_URL != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: |
+            zap-report.html
+            zap-report.json
+          retention-days: 14
+  failure-gate-2:
+    name: Failure Gate 2
+    runs-on: ubuntu-latest
+    needs:
+      - smoke-test
+      - regression-test
+      - acceptance-test
+      - dast
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Failure gate 2 criteria
+        run: |
+          echo "Failure gate 2 criteria - smoke, regression and acceptance tests passed, no HIGH or CRITICAL DAST findings"
+      - name: Download ZAP report
+        if: vars.DEV_URL != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-report
+          path: ./
+      - name: Check test and DAST results
+        if: vars.DEV_URL != ''
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then exit 1; fi
+          jq '[.site[].alerts[] | select(.riskcode=="3")] | length' zap-report.json | grep -q '^0$' || exit 1
+  performance-test:
+    name: Performance Test
+    runs-on: ubuntu-latest
+    needs: failure-gate-2
+    env:
+      DEV_URL: ${{ vars.DEV_URL }}
+      PERF_P95_MS: ${{ vars.PERF_P95_MS }}
+    if: github.event_name == 'workflow_dispatch' && inputs.RUN_PERFORMANCE && vars.DEV_URL != ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install JMeter
+        run: |
+          wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz
+          tar -xzf apache-jmeter-5.6.3.tgz
+      - name: Run JMeter performance tests
+        run: |
+          ./apache-jmeter-5.6.3/bin/jmeter -n -t performance-tests.jmx -JbaseUrl=$DEV_URL -l perf-results.jtl
+      - name: Check performance results
+        run: |
+          err=$(awk -F, 'NR>1{n++; if ($8!="true") e++} END{print (n ? e*100/n : 0)}' perf-results.jtl)
+          p95=$(tail -n +2 perf-results.jtl | cut -d, -f2 | sort -n | awk '{a[NR]=$1} END{print a[int(NR*0.95)]}')
+          if awk -v e="$err" -v p="$p95" -v m="${PERF_P95_MS:-2000}" 'BEGIN{exit !(e >= 1 || p > m)}'; then exit 1; fi
+      - name: Upload performance test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-test-report
+          path: perf-results.jtl
+          retention-days: 14
+  notify:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs:
+      - failure-gate-2
+      - performance-test
+    if: failure()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Send email notification
+        if: vars.NOTIFY_EMAIL != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ vars.SMTP_SERVER }}
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "CloudAlpha Standard Demo CI/CD Failure"
+          body: "Workflow failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          to: ${{ vars.NOTIFY_EMAIL }}
+          from: ${{ vars.NOTIFY_EMAIL }}
+      - name: NOTIFY_EMAIL not set - notification skipped
+        if: vars.NOTIFY_EMAIL == ''
+        run: echo "NOTIFY_EMAIL not set - notification skipped"
+  reports:
+    name: Collect & Upload Reports
+    runs-on: ubuntu-latest
+    needs:
+      - notify
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+      - name: Upload all reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-reports
+          path: reports/**
+          retention-days: 14
+      - name: Send run summary to Elastic dashboard
+        if: vars.ELASTIC_URL != ''
+        run: |
+          curl -X POST ${{ vars.ELASTIC_URL }} -H "Content-Type: application/json" -d '{"run_id": "${{ github.run_id }}", "status": "${{ job.status }}"}'
