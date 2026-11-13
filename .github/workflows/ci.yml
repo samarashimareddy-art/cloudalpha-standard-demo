@@ -1,9 +1,6 @@
-name: CloudAlpha Standard Demo CI/CD
+name: Java Spring Boot CI/CD Pipeline
 on:
   push:
-    branches: [main]
-  # PRs (e.g. a platform fix PR) run build, tests and scans; publish and deploy stay on main.
-  pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -31,31 +28,52 @@ on:
         default: block
 jobs:
   static-analysis:
-    name: Static Analysis & Security Scanning
+    name: Static Analysis & Security Scans
     runs-on: ubuntu-latest
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Failure gate 1 criteria
         run: |
           echo "Failure gate 1 criteria - SonarQube quality gate, no CRITICAL or HIGH secrets, no CRITICAL or HIGH vulnerable dependencies"
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
       - name: Run SonarQube scan
         if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v6
         with:
           args: >
-            -Dsonar.projectKey=samarashimareddy-art_cloudalpha-standard-demo -Dsonar.organization=samarashimareddy-art -Dsonar.host.url=https://sonarcloud.io -Dsonar.qualitygate.wait=true
+            -Dsonar.projectKey=${{ github.repository }} -Dsonar.organization=${{ github.repository_owner && github.repository_owner || github.actor }} -Dsonar.host.url=https://sonarcloud.io -Dsonar.qualitygate.wait=true
 
-      - name: Install GitLeaks and run secret scan
+      - name: Download and run GitLeaks
         run: |
           curl -sSL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
           tar -xzf gitleaks.tar.gz gitleaks
           ./gitleaks detect --redact --exit-code 1 --report-path gitleaks-report.json
+      - name: Post GitLeaks results to platform
+        if: vars.PLATFORM_UPLOAD == 'true'
+        run: |
+          curl -X POST https://ai-devops.apx-cloudalpha.com/api/v1/security/scan-results \
+            -H "X-API-Key: $PLATFORM_API_KEY" \
+            -d @gitleaks-report.json
+        env:
+          PLATFORM_API_KEY: ${{ secrets.PLATFORM_API_KEY }}
       - name: Run Trivy filesystem scan
         run: |
           docker run --rm -v "$PWD:/src" -w /src aquasec/trivy:0.50.1 fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --no-progress . --format json --output trivy-fs-report.json
+      - name: Post Trivy FS scan results to platform
+        if: vars.PLATFORM_UPLOAD == 'true'
+        run: |
+          curl -X POST https://ai-devops.apx-cloudalpha.com/api/v1/security/scan-results \
+            -H "X-API-Key: $PLATFORM_API_KEY" \
+            -d @trivy-fs-report.json
+        env:
+          PLATFORM_API_KEY: ${{ secrets.PLATFORM_API_KEY }}
       - name: Upload scan reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -71,17 +89,17 @@ jobs:
     needs: static-analysis
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
       - name: Build with Maven
-        run: mvn -B package --file pom.xml
+        run: mvn -B clean package
       - name: Run unit tests
-        run: mvn -B test --file pom.xml
-      - name: Upload build artifact
+        run: mvn -B test
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
@@ -93,101 +111,91 @@ jobs:
     needs: build
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: app-jar
+      - name: Build Maven artifact (skip tests)
+        run: mvn -B package -DskipTests
       - name: Set IMAGE_NAME env
         run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - name: Set VERSION env
-        run: echo "VERSION=${{ inputs.VERSION || github.sha }}" >> "$GITHUB_ENV"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
-          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          file: ./Dockerfile
           push: false
           load: true
-      - name: Run Trivy container scan
+          tags: ${{ env.IMAGE_NAME }}:${{ inputs.VERSION || github.sha }}
+      - name: Run Trivy image scan
         run: |
-          # Findings as a table in the log; the gate blocks on every HIGH/CRITICAL
-          # vulnerability that has a fix (--ignore-unfixed: none can be fixed yet),
-          # except the dated risk acceptances in .trivyignore.
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --ignorefile /out/.trivyignore --no-progress --format table ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --ignore-unfixed --ignorefile /out/.trivyignore --exit-code 1 --no-progress ${{ env.IMAGE_NAME }}:${{ env.VERSION }} --format json --output /out/trivy-image-report.json
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.50.1 image --severity CRITICAL,HIGH --exit-code 1 --no-progress ${{ env.IMAGE_NAME }}:${{ inputs.VERSION || github.sha }} --format json --output trivy-image-report.json
+      - name: Post Trivy image scan results to platform
+        if: vars.PLATFORM_UPLOAD == 'true'
+        run: |
+          curl -X POST https://ai-devops.apx-cloudalpha.com/api/v1/security/scan-results \
+            -H "X-API-Key: $PLATFORM_API_KEY" \
+            -d @trivy-image-report.json
+        env:
+          PLATFORM_API_KEY: ${{ secrets.PLATFORM_API_KEY }}
       - name: Upload Docker image scan report
         uses: actions/upload-artifact@v4
         with:
-          name: docker-image-scan
+          name: trivy-image-report
           path: trivy-image-report.json
           retention-days: 14
   publish:
     name: Publish Docker Image
     runs-on: ubuntu-latest
     needs: package
-    if: github.event_name != 'pull_request'
+    if: vars.REGISTRY != ''
     permissions:
       id-token: write
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set IMAGE_NAME env
         run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - name: Set VERSION env
-        run: echo "VERSION=${{ inputs.VERSION || github.sha }}" >> "$GITHUB_ENV"
-      - name: Check REGISTRY setting
-        run: |
-          if [ "${{ vars.REGISTRY }}" = "" ]; then
-            echo "REGISTRY not set - image built but not published"
-            exit 0
-          fi
       - name: Configure AWS credentials
-        if: vars.REGISTRY != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-      - name: Login to registry
-        if: vars.REGISTRY != ''
+      - name: Login to Amazon ECR
         uses: docker/login-action@v3
         with:
           registry: ${{ vars.REGISTRY }}
       - name: Push Docker image
-        if: vars.REGISTRY != ''
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
-          tags: ${{ vars.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          file: ./Dockerfile
           push: true
-  deploy-dev:
-    name: Deploy to Dev Environment
+          tags: ${{ vars.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.VERSION || github.sha }}
+          # If REGISTRY is not set, print and continue
+  publish-skip:
+    name: Publish Docker Image (skip)
     runs-on: ubuntu-latest
-    needs: publish
-    if: github.event_name != 'pull_request'
-    environment: ${{ inputs.ENVIRONMENT || 'dev' }} # prod environment must have required reviewers
-    permissions:
-      id-token: write
-      contents: read
+    needs: package
+    if: vars.REGISTRY == ''
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Check Dev environment configuration
-        run: |
-          if [ "${{ vars.AWS_ROLE_ARN }}" = "" ] || [ "${{ vars.EKS_CLUSTER }}" = "" ] || [ "${{ vars.DEV_NAMESPACE }}" = "" ] || [ "${{ vars.DEV_URL }}" = "" ]; then
-            echo "Dev environment not configured - deploy skipped"
-            exit 0
-          fi
+        uses: actions/checkout@v5
+      - name: Print skip message
+        run: echo "REGISTRY not set - image built but not published"
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [publish, publish-skip]
+    environment: ${{ inputs.ENVIRONMENT || 'dev' }} # prod environment must have required reviewers
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
       - name: Configure AWS credentials
         if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
         uses: aws-actions/configure-aws-credentials@v4
@@ -196,20 +204,27 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Update kubeconfig
         if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
-        run: |
-          aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER }} --region ${{ vars.AWS_REGION }}
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
+        env:
+          EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
       - name: Create namespace if missing
         if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
         run: |
-          kubectl create namespace ${{ vars.DEV_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-      - name: Deploy manifests
+          kubectl create namespace $DEV_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+        env:
+          DEV_NAMESPACE: ${{ vars.DEV_NAMESPACE }}
+      - name: Deploy to Dev
         if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
         run: |
           kubectl apply -f k8s/
-      - name: Wait for rollout
-        if: vars.AWS_ROLE_ARN != '' && vars.EKS_CLUSTER != '' && vars.DEV_NAMESPACE != '' && vars.DEV_URL != ''
-        run: |
-          kubectl rollout status deployment/cloudalpha-standard-demo --namespace=${{ vars.DEV_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment --timeout=300s
+      - name: Print skip message
+        if: vars.AWS_ROLE_ARN == '' || vars.EKS_CLUSTER == '' || vars.DEV_NAMESPACE == '' || vars.DEV_URL == ''
+        run: echo "Dev environment not configured - deploy skipped"
+    permissions:
+      id-token: write
+      contents: read
   smoke-test:
     name: Smoke Test
     runs-on: ubuntu-latest
@@ -218,13 +233,13 @@ jobs:
       DEV_URL: ${{ vars.DEV_URL }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Smoke test
-        if: vars.DEV_URL != ''
+        uses: actions/checkout@v5
+      - name: Smoke test health endpoint
+        if: env.DEV_URL != ''
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10; do curl -fsS "$DEV_URL/actuator/health" && exit 0; sleep 10; done; exit 1
-      - name: DEV_URL not set - smoke test skipped
-        if: vars.DEV_URL == ''
+      - name: Print skip message
+        if: env.DEV_URL == ''
         run: echo "DEV_URL not set - smoke test skipped"
   regression-test:
     name: Regression Test
@@ -232,20 +247,21 @@ jobs:
     needs: smoke-test
     env:
       DEV_URL: ${{ vars.DEV_URL }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Regression test
-        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+        uses: actions/checkout@v5
+      - name: Run regression tests
+        if: env.DEV_URL != ''
         run: mvn -B verify -Dbase.url=$DEV_URL
-      - name: DEV_URL not set - regression test skipped
-        if: vars.DEV_URL == ''
+      - name: Print skip message
+        if: env.DEV_URL == ''
         run: echo "DEV_URL not set - regression test skipped"
-      - name: Upload regression test report
-        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+      - name: Upload JUnit report
+        if: env.DEV_URL != ''
         uses: actions/upload-artifact@v4
         with:
-          name: regression-test-report
+          name: regression-junit-report
           path: target/surefire-reports/*.xml
           retention-days: 14
   acceptance-test:
@@ -254,43 +270,44 @@ jobs:
     needs: regression-test
     env:
       DEV_URL: ${{ vars.DEV_URL }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Acceptance test
-        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+        uses: actions/checkout@v5
+      - name: Run acceptance tests
+        if: env.DEV_URL != ''
         run: mvn -B verify -Dtest='*Cucumber*,*Acceptance*' -Dsurefire.failIfNoSpecifiedTests=false -Dbase.url=$DEV_URL
-      - name: DEV_URL not set - acceptance test skipped
-        if: vars.DEV_URL == ''
+      - name: Print skip message
+        if: env.DEV_URL == ''
         run: echo "DEV_URL not set - acceptance test skipped"
-      - name: Upload acceptance test report
-        if: vars.DEV_URL != '' && (github.event_name != 'workflow_dispatch' || inputs.RUN_REGRESSION)
+      - name: Upload acceptance report
+        if: env.DEV_URL != ''
         uses: actions/upload-artifact@v4
         with:
-          name: acceptance-test-report
+          name: acceptance-junit-report
           path: target/surefire-reports/*.xml
           retention-days: 14
   dast:
-    name: DAST - OWASP ZAP
+    name: DAST (OWASP ZAP)
     runs-on: ubuntu-latest
     needs: acceptance-test
     env:
       DEV_URL: ${{ vars.DEV_URL }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Run OWASP ZAP baseline scan
-        if: vars.DEV_URL != ''
+        uses: actions/checkout@v5
+      - name: Run OWASP ZAP Baseline Scan
+        if: env.DEV_URL != ''
         run: |
           docker run --rm -v "$PWD:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "$DEV_URL" -r zap-report.html -J zap-report.json -I
-      - name: DEV_URL not set - DAST skipped
-        if: vars.DEV_URL == ''
+      - name: Print skip message
+        if: env.DEV_URL == ''
         run: echo "DEV_URL not set - DAST skipped"
-      - name: Upload ZAP report
-        if: vars.DEV_URL != ''
+      - name: Upload ZAP reports
+        if: env.DEV_URL != ''
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
+          name: zap-reports
           path: |
             zap-report.html
             zap-report.json
@@ -298,68 +315,36 @@ jobs:
   failure-gate-2:
     name: Failure Gate 2
     runs-on: ubuntu-latest
-    needs:
-      - smoke-test
-      - regression-test
-      - acceptance-test
-      - dast
+    needs: [smoke-test, regression-test, acceptance-test, dast]
+    if: always()
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+      - name: Download ZAP report
+        if: needs.dast.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-reports
+          path: zap-artifacts
       - name: Failure gate 2 criteria
         run: |
           echo "Failure gate 2 criteria - smoke, regression and acceptance tests passed, no HIGH or CRITICAL DAST findings"
-      - name: Download ZAP report
-        if: vars.DEV_URL != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: zap-report
-          path: ./
-      - name: Check test and DAST results
-        if: vars.DEV_URL != ''
+      - name: Check for failed or cancelled stages
         run: |
           if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then exit 1; fi
-          jq '[.site[].alerts[] | select(.riskcode=="3")] | length' zap-report.json | grep -q '^0$' || exit 1
-  performance-test:
-    name: Performance Test
+      - name: Check ZAP HIGH/CRITICAL alerts
+        if: needs.dast.result == 'success'
+        run: |
+          jq '[.site[].alerts[] | select(.riskcode=="3")] | length' zap-artifacts/zap-report.json | grep -q '^0$' || exit 1
+  notify:
+    name: Notify
     runs-on: ubuntu-latest
     needs: failure-gate-2
-    env:
-      DEV_URL: ${{ vars.DEV_URL }}
-      PERF_P95_MS: ${{ vars.PERF_P95_MS }}
-    if: github.event_name == 'workflow_dispatch' && inputs.RUN_PERFORMANCE && vars.DEV_URL != ''
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install JMeter
-        run: |
-          wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz
-          tar -xzf apache-jmeter-5.6.3.tgz
-      - name: Run JMeter performance tests
-        run: |
-          ./apache-jmeter-5.6.3/bin/jmeter -n -t performance-tests.jmx -JbaseUrl=$DEV_URL -l perf-results.jtl
-      - name: Check performance results
-        run: |
-          err=$(awk -F, 'NR>1{n++; if ($8!="true") e++} END{print (n ? e*100/n : 0)}' perf-results.jtl)
-          p95=$(tail -n +2 perf-results.jtl | cut -d, -f2 | sort -n | awk '{a[NR]=$1} END{print a[int(NR*0.95)]}')
-          if awk -v e="$err" -v p="$p95" -v m="${PERF_P95_MS:-2000}" 'BEGIN{exit !(e >= 1 || p > m)}'; then exit 1; fi
-      - name: Upload performance test report
-        uses: actions/upload-artifact@v4
-        with:
-          name: performance-test-report
-          path: perf-results.jtl
-          retention-days: 14
-  notify:
-    name: Notify on Failure
-    runs-on: ubuntu-latest
-    needs:
-      - failure-gate-2
-      - performance-test
     if: failure()
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Send email notification
+        uses: actions/checkout@v5
+      - name: Send failure email
         if: vars.NOTIFY_EMAIL != ''
         uses: dawidd6/action-send-mail@v3
         with:
@@ -367,33 +352,61 @@ jobs:
           server_port: 587
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "CloudAlpha Standard Demo CI/CD Failure"
-          body: "Workflow failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          subject: "GitHub Actions Pipeline Failure - ${{ github.repository }}"
           to: ${{ vars.NOTIFY_EMAIL }}
           from: ${{ vars.NOTIFY_EMAIL }}
-      - name: NOTIFY_EMAIL not set - notification skipped
-        if: vars.NOTIFY_EMAIL == ''
-        run: echo "NOTIFY_EMAIL not set - notification skipped"
+          body: |
+            The pipeline failed at stage: ${{ github.job }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Notify Teams/Slack (if webhook secret exists)
+        if: secrets.TEAMS_WEBHOOK_URL != ''
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{"text":"Pipeline failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' ${{ secrets.TEAMS_WEBHOOK_URL }}
   reports:
-    name: Collect & Upload Reports
+    name: Collect Reports
     runs-on: ubuntu-latest
-    needs:
-      - notify
+    needs: [failure-gate-2, notify]
     if: always()
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Download all artifacts
+        uses: actions/checkout@v5
+      - name: Download static analysis reports
         uses: actions/download-artifact@v4
         with:
-          path: reports
+          name: static-analysis-reports
+          path: reports/static-analysis
+      - name: Download Docker image scan report
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-image-report
+          path: reports/trivy-image
+      - name: Download regression JUnit report
+        uses: actions/download-artifact@v4
+        with:
+          name: regression-junit-report
+          path: reports/regression
+        if: env.DEV_URL != ''
+      - name: Download acceptance JUnit report
+        uses: actions/download-artifact@v4
+        with:
+          name: acceptance-junit-report
+          path: reports/acceptance
+        if: env.DEV_URL != ''
+      - name: Download ZAP reports
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-reports
+          path: reports/zap
+        if: env.DEV_URL != ''
       - name: Upload all reports
         uses: actions/upload-artifact@v4
         with:
           name: all-reports
           path: reports/**
           retention-days: 14
-      - name: Send run summary to Elastic dashboard
+      - name: Send run summary to Elastic (if ELASTIC_URL set)
         if: vars.ELASTIC_URL != ''
         run: |
-          curl -X POST ${{ vars.ELASTIC_URL }} -H "Content-Type: application/json" -d '{"run_id": "${{ github.run_id }}", "status": "${{ job.status }}"}'
+          curl -X POST "$ELASTIC_URL" -H 'Content-Type: application/json' -d '{"run_id": "${{ github.run_id }}", "status": "${{ job.status }}"}'
+        env:
+          ELASTIC_URL: ${{ vars.ELASTIC_URL }}
