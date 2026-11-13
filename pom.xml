@@ -24,7 +24,7 @@
     <junit-jupiter.version>5.14.2</junit-jupiter.version>
     <!-- Fixed versions for the HIGH/CRITICAL findings of the image scan -->
     <jackson-bom.version>2.21.7</jackson-bom.version>
-    <tomcat.version>10.1.55</tomcat.version>
+    <tomcat.version>10.1.59</tomcat.version>
     <!-- Regression and acceptance tests run against a deployed URL (stages 10, 11). -->
     <base.url>http://localhost:8080</base.url>
     <!-- Unit-test line coverage the build must reach (company standard, unit test stage). -->
