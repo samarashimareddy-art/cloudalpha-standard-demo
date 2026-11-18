@@ -336,7 +336,6 @@ jobs:
       - name: Build Docker Image
         run: |
           docker build -t ${{ env.IMAGE_NAME }}:${{ inputs.VERSION || github.sha }} .
-          docker load
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
