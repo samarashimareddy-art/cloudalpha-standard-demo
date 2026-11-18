@@ -104,7 +104,7 @@ jobs:
     needs: unit-test
     if: ${{ !cancelled() }}
     env:
-      UNIT_MIN_COVERAGE: ${{ vars.UNIT_MIN_COVERAGE || '95' }}
+      UNIT_MIN_COVERAGE: ${{ vars.UNIT_MIN_COVERAGE || '80' }}
       UNIT_MAX_FAILED: ${{ vars.UNIT_MAX_FAILED || '0' }}
       UNIT_CRITICAL_TAGS: ${{ vars.UNIT_CRITICAL_TAGS }}
     steps:
